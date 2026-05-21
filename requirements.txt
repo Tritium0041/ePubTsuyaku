@@ -1,0 +1,4 @@
+beautifulsoup4>=4.12
+EbookLib>=0.18
+openai>=1.0
+Flask>=3.0

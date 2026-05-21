@@ -1,80 +1,192 @@
 # epubTranslatorWithLLM
 
-这是一个使用OpenAI的LLM（大语言模型）进行epub电子书内容总结和翻译，并重新构建epub电子书的项目。项目主要功能包括提取epub电子书的内容，使用LLM对文本内容进行总结和翻译，最后将翻译后的内容重新构建成新的epub电子书。
+这是一个基于 LLM 的 EPUB 电子书翻译工具。当前版本已经从早期单文件脚本重构为完整流水线，按你博客里的方法实现了：
 
-## 项目功能
+1. `全书顺序定调/要素抽取`
+2. `按冻结章节上下文并行初翻`
+3. `逐批校对`
+4. `断点恢复与结果重建`
 
-### 1. 提取epub内容
-- 从指定的epub文件中提取各种类型的内容，包括文本、其他文档格式以及其他项目。
+同时补上了断点续跑、OpenAI 兼容接口接入、章节顺序修复、目录与资源保留、本地 `mock` 联调模式，以及一个本地可直接使用的 Web UI。
 
-### 2. 内容总结和翻译
-- 使用OpenAI的LLM对提取的文本内容进行总结，按照特定的格式输出人物、时间、地点、主要动作、提出的概念以及其他重要细节。
-- 将提取的文本内容从源语言翻译为目标语言，同时遵循特定的翻译要求，如语义忠实、格式一致等。
+## 现在支持的能力
 
-### 3. 重新构建epub电子书
-- 根据翻译后的内容，重新构建一个新的epub电子书，包含翻译后的文本内容、设置好的样式和目录结构。
+- 按 EPUB `spine` 顺序处理正文，避免早期版本的章节顺序错乱。
+- 先按章节顺序完成全书摘要，再基于每章冻结好的上下文快照并行翻译批次。
+- 可选接入一册已经精翻完成的前作 EPUB，先抽取系列惯用译名和文风，再作为软参考参与后续摘要、翻译和校对。
+- 翻译后自动做一轮校对；如果分数过低或发现明显问题，会按反馈重翻。
+- DeepSeek 官方接口会优先走严格 schema / JSON mode，并关闭 thinking 以提高结构化输出稳定性。
+- 尽量保留原始 XHTML 结构，而不是把章节全部重建成纯段落模板。
+- 保留原书的资源、目录和大部分元数据，并输出新的 EPUB。
+- 使用 `progress.json` 做断点恢复；摘要阶段、已完成批次和已完成章节都会被保留。
+- 支持任意 OpenAI 兼容接口，也保留了对 `ALIYUN_API_KEY` / `DEEPSEEK_API_KEY` 的兼容。
+- 支持 `--provider mock`，方便本地跑通流程和做测试。
+- 支持 `Web UI`：页面里直接选书、填 key、看实时进度、下载输出 EPUB。
 
-## 环境配置
+## 安装
 
-### 1. 安装依赖
-确保你已经安装了以下Python库：
 ```bash
-pip install ebooklib bs4 openai jinja2
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-### 2. 设置API密钥
-在运行项目之前，你需要设置OpenAI的API密钥。本项目使用了阿里云和DeepSeek的兼容API，你需要将对应的API密钥设置为环境变量：
+如果你暂时不用 `uv`，也可以继续用：
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+## 环境变量
+
+优先级从高到低如下：
+
+1. `EPUB_TRANSLATOR_API_KEY`
+2. `OPENAI_API_KEY`
+3. `ALIYUN_API_KEY`
+4. `DEEPSEEK_API_KEY`
+
+可选变量：
+
+```bash
+export EPUB_TRANSLATOR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export EPUB_TRANSLATOR_MODEL=qwen-max
+```
+
+如果你沿用旧配置，也可以直接：
+
 ```bash
 export ALIYUN_API_KEY=your_aliyun_api_key
 export DEEPSEEK_API_KEY=your_deepseek_api_key
 ```
 
-## 项目结构
+## 快速开始
+
+### 1. Web UI
+
+推荐直接起页面：
+
+```bash
+uv run --python .venv/bin/python webui.py
 ```
+
+默认打开本地服务：
+
+```text
+http://127.0.0.1:7860
+```
+
+页面里可以直接：
+
+- 选择项目目录下已有的 `.epub`
+- 或手动填绝对路径
+- 或上传一个新的 `.epub`
+- 可选再给一个“前作精翻参考 EPUB”，用于提取系列既有译名和文风
+- 配置 `DeepSeek / 阿里云 / OpenAI Compatible / Mock`
+- 填 `API Key`、模型、批次大小、片段上限、并发数、重试次数
+- 实时查看摘要进度、翻译批次进度、活动 worker 和日志
+- 任务完成后直接下载输出文件
+
+### 2. CLI
+
+如果你更想走命令行：
+
+把待翻译的书放进 `testBook/`，或者直接通过 `--input` 指定路径。
+
+最简单的运行方式：
+
+```bash
+uv run --python .venv/bin/python main.py --input testBook/yourbook.epub --source-lang 日语 --target-lang 中文
+```
+
+显式指定 OpenAI 兼容接口：
+
+```bash
+uv run --python .venv/bin/python main.py \
+  --input testBook/yourbook.epub \
+  --reference-epub /path/to/previous-volume.zh.epub \
+  --source-lang 日语 \
+  --target-lang 中文 \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --model qwen-max
+```
+
+本地联调，不调用真实模型：
+
+```bash
+uv run --python .venv/bin/python main.py \
+  --input testBook/yourbook.epub \
+  --source-lang 日语 \
+  --target-lang 中文 \
+  --provider mock \
+  --title-suffix "（中文译本）"
+```
+
+默认输出到 `epubOutput/<原文件名>.<目标语言>.epub`。
+
+## 常用参数
+
+- `--progress-file progress.json`：指定断点续跑文件。
+- `--reset-progress`：忽略已有进度，从头重新翻。
+- `--reference-epub /path/to/book.epub`：可选，提供前作精翻 EPUB 作为系列软参考。
+- `--max-batch-chars 3500`：控制单次发给模型的字符数。
+- `--max-batch-segments 64`：控制单次发给模型的片段数，避免碎片文本一次塞太多 id。
+- `--translation-workers 4`：翻译阶段的并发 worker 数。
+- `--max-review-retries 2`：校对不通过时的最大重试次数。
+- `--min-review-score 85`：低于该分数时触发重试。
+- `--summary-model / --translation-model / --review-model`：按阶段拆分模型。
+- `--title-suffix "（中文译本）"`：给输出书名加后缀。
+
+## 项目结构
+
+```text
 epubTranslatorWithLLM/
-├── epubTemplates/
-│   ├── 00.html
-│   └── Style.css
-├── testBook/
-│   └── yourbook.epub
 ├── main.py
+├── webui.py
+├── requirements.txt
+├── translator/
+│   ├── cli.py
+│   ├── config.py
+│   ├── epub_utils.py
+│   ├── llm.py
+│   ├── pipeline.py
+│   ├── prompts.py
+│   ├── state.py
+│   ├── webapp.py
+│   ├── static/
+│   └── templates/
+├── tests/
+│   ├── test_pipeline.py
+│   ├── test_state.py
+│   └── test_webapp.py
+├── epubTemplates/
 └── README.md
 ```
 
-### 主要文件说明
-- `main.py`：主程序文件，包含主要的函数和程序入口。
-- `epubTemplates/`：存放epub电子书构建所需的模板文件和样式文件。
-- `testBook/`：存放待处理的epub电子书文件。
+说明：
 
-## 使用方法
+- `main.py`：CLI 入口。
+- `webui.py`：本地 Web UI 入口。
+- `translator/pipeline.py`：完整翻译流水线。
+- `translator/llm.py`：OpenAI 兼容客户端和 mock 客户端。
+- `translator/epub_utils.py`：EPUB 文档提取、分批、内容回写。
+- `translator/state.py`：上下文状态和 progress 持久化。
+- `translator/webapp.py`：Flask UI、后台任务调度与下载接口。
+- `tests/`：无网络的本地回归测试。
+- `epubTemplates/`：早期模板文件，当前流程默认保留原 XHTML 结构，不再依赖模板重建正文。
 
-### 1. 准备工作
-将需要处理的epub电子书文件放入 `testBook/` 目录下。
+## 测试
 
-修改main.py文件中的以下变量：
-```python
-# 待处理的epub文件名
-book = epub.read_epub('testBook/yourbook.epub')
-model = "your preferred model"
-sourceLang = ""
-targetLang = ""
-```
-
-### 2. 运行项目
-在项目根目录下，运行以下命令：
 ```bash
-python main.py
+uv run --python .venv/bin/python -m unittest discover -s tests -q
 ```
 
-### 3. 查看结果
-处理完成后，翻译后的epub电子书将保存在 `epubOutput/` 目录下，文件名为 `output.epub`。
+## 兼容性说明
 
-## 注意事项
-- 项目运行过程中会生成一个 `progress.json` 文件，用于记录处理进度，方便程序中断后继续处理。处理完成后，可以使用 `cleanUp()` 函数删除该文件。
-- 项目中使用的LLM模型为 `qwen-max`，如果需要更换模型，请修改 `model` 变量的值。
-- 默认使用并行模式处理，如果需要更改为串行模式，请修改 `parallel` 变量的值。
-- 并行模式下不会保存进度，请保证网络稳定
-- 一本书也就不到50w token吧 不贵
+- 推荐 Python 3.9+。
+- 摘要阶段按章节顺序串行执行；翻译阶段按批次并行执行，默认 `4` 个 worker。
+- 如果提供了 `--reference-epub`，会先串行执行一个 `reference phase`，提取前作的惯用译名与风格提示；更换参考书后会自动使旧 progress 失效并重跑。
+- `progress.json` 会保留中间结果，便于中断恢复，也便于手工检查上下文和校对结果。
 
 ## 许可证
+
 本项目使用 [MIT许可证](https://opensource.org/licenses/MIT)，你可以自由使用、修改和分发本项目。

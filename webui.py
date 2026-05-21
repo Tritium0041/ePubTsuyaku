@@ -1,4 +1,4 @@
-from translator.cli import main
+from translator.webapp import main
 
 
 if __name__ == "__main__":

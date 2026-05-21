@@ -2,3 +2,10 @@ testBook/
 progress.json
 .DS_Store
 .idea/*
+__pycache__/
+*.pyc
+.venv/
+epubOutput/*.epub
+.webui/
+progress.*.json
+/*.epub
