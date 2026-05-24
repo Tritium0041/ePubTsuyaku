@@ -57,6 +57,8 @@ def _default_form_state() -> Dict[str, Any]:
         "translation_model": "",
         "review_model": "",
         "translation_workers": "4",
+        "review_workers": "",
+        "reference_workers": "",
         "max_batch_chars": "4000",
         "max_batch_segments": "64",
         "max_review_retries": "2",
@@ -83,6 +85,8 @@ def _form_state_from_form_data(form_data: Dict[str, str]) -> Dict[str, Any]:
         "translation_model",
         "review_model",
         "translation_workers",
+        "review_workers",
+        "reference_workers",
         "max_batch_chars",
         "max_batch_segments",
         "max_review_retries",
@@ -211,6 +215,8 @@ class JobState:
     reference_input_path: str = ""
     reference_input_label: str = ""
     translation_workers: int = 0
+    review_workers: int = 0
+    reference_workers: int = 0
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
@@ -376,6 +382,7 @@ class JobManager:
                     payload.get("completed_batch_count", job.translation_completed_batch_count) or 0
                 )
                 job.translation_workers = int(payload.get("translation_workers", job.translation_workers) or 0)
+                job.review_workers = int(payload.get("review_workers", job.review_workers) or 0)
                 return
 
             if event == "translation_document_started":
@@ -394,6 +401,7 @@ class JobManager:
                 job.current_batch_total = int(payload.get("total_batches", 0) or 0)
                 job.active_workers = int(payload.get("active_workers", job.active_workers) or 0)
                 job.translation_workers = int(payload.get("translation_workers", job.translation_workers) or 0)
+                job.review_workers = int(payload.get("review_workers", job.review_workers) or 0)
                 return
 
             if event == "translation_batch_retry":
@@ -537,6 +545,8 @@ class JobManager:
             output_path = self.project_root / "epubOutput" / f"{logical_stem}.{_sanitize_filename_part(target_language)}.epub"
 
             translation_workers = max(1, int(form_data.get("translation_workers") or 4))
+            review_workers = max(0, int(form_data.get("review_workers") or 0))
+            reference_workers = max(0, int(form_data.get("reference_workers") or 0))
             max_batch_chars = int(form_data.get("max_batch_chars") or 4000)
             max_batch_segments = int(form_data.get("max_batch_segments") or 64)
             max_review_retries = int(form_data.get("max_review_retries") or 2)
@@ -559,6 +569,8 @@ class JobManager:
                 translation_model=(form_data.get("translation_model") or "").strip() or resolved_model,
                 review_model=(form_data.get("review_model") or "").strip() or resolved_model,
                 translation_workers=translation_workers,
+                review_workers=review_workers,
+                reference_workers=reference_workers,
                 auto_resume_retries=2,
                 max_batch_chars=max_batch_chars,
                 max_batch_segments=max_batch_segments,
@@ -587,6 +599,8 @@ class JobManager:
                 reference_input_path=str(reference_input_path) if reference_input_path else "",
                 reference_input_label=reference_input_label,
                 translation_workers=translation_workers,
+                review_workers=review_workers or translation_workers,
+                reference_workers=reference_workers or translation_workers,
                 reference_enabled=reference_input_path is not None,
                 reference_book=reference_book_metadata,
                 reference_total_count=int(reference_book_metadata.get("document_count", 0) or 0),
@@ -649,6 +663,8 @@ class JobManager:
                     result.get("translation_total_batch_count", job.translation_total_batch_count) or 0
                 )
                 job.translation_workers = int(result.get("translation_workers", job.translation_workers) or 0)
+                job.review_workers = int(result.get("review_workers", job.review_workers) or 0)
+                job.reference_workers = int(result.get("reference_workers", job.reference_workers) or 0)
                 job.reference_enabled = bool(result.get("reference_enabled", job.reference_enabled))
                 job.reference_completed_count = int(result.get("reference_completed_count", job.reference_completed_count) or 0)
                 job.active_workers = 0

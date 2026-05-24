@@ -1,4 +1,5 @@
 import copy
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,6 +56,8 @@ def make_config(
     progress_path: Path,
     provider: str = "mock",
     translation_workers: int = 4,
+    review_workers: int = 0,
+    reference_workers: int = 0,
     max_batch_chars: int = 1000,
     max_batch_segments: int = 64,
     max_review_retries: int = 0,
@@ -79,6 +82,8 @@ def make_config(
         translation_model=model,
         review_model=model,
         translation_workers=translation_workers,
+        review_workers=review_workers,
+        reference_workers=reference_workers,
         max_batch_chars=max_batch_chars,
         max_batch_segments=max_batch_segments,
         max_review_retries=max_review_retries,
@@ -507,6 +512,200 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertLessEqual(len(second_shared["translated_inputs"]), 2)
             self.assertTrue(any("第二段。" in item for item in second_shared["translated_inputs"]))
             self.assertEqual(result["translation_completed_batch_count"], 4)
+
+    def test_completed_batches_resume_without_persisted_translated_html(self):
+        shared = {"translate_calls": 0}
+
+        class CountingClient:
+            def extract_reference_patch(self, *args, **kwargs):
+                return {"series_notes": [], "style_notes": [], "characters": [], "terms": []}
+
+            def summarize(self, *args, **kwargs):
+                return empty_summary_response()
+
+            def translate(self, *args, **kwargs):
+                shared["translate_calls"] += 1
+                return {segment["id"]: f"[中文] {segment['text']}" for segment in kwargs["segments"]}
+
+            def review(self, *args, **kwargs):
+                return ok_review_response()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_path = tmp_path / "input.epub"
+            output_path_one = tmp_path / "output-one.epub"
+            output_path_two = tmp_path / "output-two.epub"
+            progress_path = tmp_path / "progress.json"
+
+            build_sample_epub(
+                input_path,
+                chapters=[("第一章", ["第一段。", "第二段。", "第三段。"])],
+            )
+            base_config = make_config(
+                input_path=input_path,
+                output_path=output_path_one,
+                progress_path=progress_path,
+                provider="openai-compatible",
+                translation_workers=1,
+                max_batch_segments=1,
+                reset_progress=True,
+            )
+
+            with patch("translator.pipeline._build_llm_client", side_effect=lambda *_: CountingClient()):
+                first_result = run_translation_pipeline(base_config)
+
+            self.assertEqual(first_result["processed_count"], 1)
+            self.assertEqual(shared["translate_calls"], 4)
+
+            saved_progress = load_progress(progress_path)
+            saved_record = saved_progress["documents"]["chapter1.xhtml"]
+            self.assertEqual(saved_record["translation_status"], "done")
+            self.assertEqual(saved_record["translated_html"], "")
+            self.assertEqual(len(saved_record["translated_batches"]), 4)
+
+            shared["translate_calls"] = 0
+            resume_config = make_config(
+                input_path=input_path,
+                output_path=output_path_two,
+                progress_path=progress_path,
+                provider="openai-compatible",
+                translation_workers=1,
+                max_batch_segments=1,
+            )
+            with patch("translator.pipeline._build_llm_client", side_effect=lambda *_: CountingClient()):
+                second_result = run_translation_pipeline(resume_config)
+
+            self.assertEqual(second_result["processed_count"], 0)
+            self.assertEqual(second_result["skipped_count"], 1)
+            self.assertEqual(shared["translate_calls"], 0)
+
+            book_one = epub.read_epub(str(output_path_one))
+            book_two = epub.read_epub(str(output_path_two))
+            chapter_one = book_one.get_item_with_href("chapter1.xhtml").get_content().decode("utf-8")
+            chapter_two = book_two.get_item_with_href("chapter1.xhtml").get_content().decode("utf-8")
+            self.assertEqual(chapter_one, chapter_two)
+
+    def test_translation_workers_continue_while_review_is_waiting(self):
+        events = {
+            "first_review_started": threading.Event(),
+            "second_translate_started": threading.Event(),
+        }
+        shared = {"translate_calls": 0, "review_saw_second_translate": False}
+
+        class PipelinedClient:
+            def extract_reference_patch(self, *args, **kwargs):
+                return {"series_notes": [], "style_notes": [], "characters": [], "terms": []}
+
+            def summarize(self, *args, **kwargs):
+                return empty_summary_response()
+
+            def translate(self, *args, **kwargs):
+                joined = " ".join(segment["text"] for segment in kwargs["segments"])
+                if "第一段。" in joined or "第二段。" in joined:
+                    shared["translate_calls"] += 1
+                if "第二段。" in joined:
+                    events["second_translate_started"].set()
+                return {segment["id"]: f"[中文] {segment['text']}" for segment in kwargs["segments"]}
+
+            def review(self, *args, **kwargs):
+                joined = " ".join(segment["text"] for segment in kwargs["source_segments"])
+                if "第一段。" in joined:
+                    events["first_review_started"].set()
+                    shared["review_saw_second_translate"] = events["second_translate_started"].wait(timeout=2)
+                return ok_review_response()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_path = tmp_path / "input.epub"
+            output_path = tmp_path / "output.epub"
+            progress_path = tmp_path / "progress.json"
+
+            build_sample_epub(
+                input_path,
+                chapters=[("第一章", ["第一段。", "第二段。"])],
+            )
+            config = make_config(
+                input_path=input_path,
+                output_path=output_path,
+                progress_path=progress_path,
+                provider="openai-compatible",
+                translation_workers=1,
+                review_workers=1,
+                max_batch_segments=1,
+            )
+
+            with patch("translator.pipeline._build_llm_client", side_effect=lambda *_: PipelinedClient()):
+                result = run_translation_pipeline(config)
+
+            self.assertEqual(result["processed_count"], 1)
+            self.assertTrue(events["first_review_started"].is_set())
+            self.assertTrue(events["second_translate_started"].is_set())
+            self.assertTrue(shared["review_saw_second_translate"])
+
+    def test_reference_phase_extracts_documents_in_parallel_and_merges_in_order(self):
+        events = {
+            "first_reference_started": threading.Event(),
+            "second_reference_started": threading.Event(),
+        }
+        shared = {"first_waited_for_second": False}
+
+        class ParallelReferenceClient:
+            def extract_reference_patch(self, *args, **kwargs):
+                joined = " ".join(segment["text"] for segment in kwargs["segments"])
+                if "参考一" in joined:
+                    events["first_reference_started"].set()
+                    shared["first_waited_for_second"] = events["second_reference_started"].wait(timeout=2)
+                    return {"series_notes": ["一"], "style_notes": [], "characters": [], "terms": []}
+                if "参考二" in joined:
+                    events["second_reference_started"].set()
+                    return {"series_notes": ["二"], "style_notes": [], "characters": [], "terms": []}
+                return {"series_notes": [], "style_notes": [], "characters": [], "terms": []}
+
+            def summarize(self, *args, **kwargs):
+                return empty_summary_response()
+
+            def translate(self, *args, **kwargs):
+                return {segment["id"]: f"[中文] {segment['text']}" for segment in kwargs["segments"]}
+
+            def review(self, *args, **kwargs):
+                return ok_review_response()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_path = tmp_path / "input.epub"
+            reference_path = tmp_path / "reference.epub"
+            output_path = tmp_path / "output.epub"
+            progress_path = tmp_path / "progress.json"
+
+            build_sample_epub(input_path)
+            build_sample_epub(
+                reference_path,
+                chapters=[
+                    ("前作一", ["参考一。"]),
+                    ("前作二", ["参考二。"]),
+                ],
+                title="Series Ref",
+                language="zh",
+            )
+            config = make_config(
+                input_path=input_path,
+                output_path=output_path,
+                progress_path=progress_path,
+                provider="openai-compatible",
+                reference_input_path=reference_path,
+                translation_workers=1,
+                reference_workers=2,
+            )
+
+            with patch("translator.pipeline._build_llm_client", side_effect=lambda *_: ParallelReferenceClient()):
+                result = run_translation_pipeline(config)
+
+            self.assertEqual(result["reference_completed_count"], 2)
+            self.assertTrue(events["first_reference_started"].is_set())
+            self.assertTrue(events["second_reference_started"].is_set())
+            self.assertTrue(shared["first_waited_for_second"])
+            progress = load_progress(progress_path)
+            self.assertEqual(progress["reference_phase"]["reference_profile"]["series_notes"], ["一", "二"])
 
     def test_auto_resume_retries_retryable_run_errors_and_reuses_progress(self):
         shared = {"translated_inputs": [], "failed_once": False}

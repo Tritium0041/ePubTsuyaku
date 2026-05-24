@@ -641,6 +641,51 @@ def _extract_reference_document_patch(
     return _reference_patch_from_profile(document_profile)
 
 
+def _extract_reference_document_worker(
+    *,
+    config: PipelineConfig,
+    prepared: PreparedDocument,
+    book_metadata: Dict[str, str],
+    base_reference_profile: Dict[str, Any],
+    thread_local: threading.local,
+    log: Callable[[str], None],
+    emit: Callable[[str], None],
+    total_document_count: int,
+) -> Dict[str, Any]:
+    plan = prepared.plan
+    emit(
+        "reference_document_started",
+        index=prepared.index,
+        file_name=plan.file_name,
+        segment_count=len(plan.segments),
+        total_document_count=total_document_count,
+    )
+    if not plan.segments:
+        log(f"[reference-pass] {prepared.index}. {plan.file_name} (no text)")
+        patch = empty_reference_patch()
+    else:
+        log(f"[reference] {prepared.index}. {plan.file_name} ({len(plan.segments)} segments)")
+        reference_client = getattr(thread_local, "reference_client", None)
+        if reference_client is None:
+            reference_client = _build_llm_client(config)
+            thread_local.reference_client = reference_client
+        patch = _extract_reference_document_patch(
+            config=config,
+            reference_client=reference_client,
+            book_metadata=book_metadata,
+            base_reference_profile=base_reference_profile,
+            segments=plan.segments,
+            log=log,
+        )
+
+    return {
+        "index": prepared.index,
+        "file_name": plan.file_name,
+        "patch": patch,
+        "segment_count": len(plan.segments),
+    }
+
+
 def _split_segments_balanced(segments: List[Dict[str, str]]) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     if len(segments) <= 1:
         return list(segments), []
@@ -792,8 +837,9 @@ def run_reference_phase(
 ) -> Dict[str, Any]:
     total_document_count = len(prepared_documents)
     reference_profile = new_reference_profile(reference_book_metadata, config.target_language)
-    reference_client = _build_llm_client(config)
     reference_completed_count = 0
+    reference_workers = max(1, config.reference_workers or config.translation_workers)
+    thread_local = threading.local()
 
     progress["reference_phase"]["status"] = "running"
     progress["reference_phase"]["completed_count"] = 0
@@ -807,57 +853,25 @@ def run_reference_phase(
         reference_fingerprint=reference_fingerprint,
     )
 
-    for prepared in prepared_documents:
-        plan = prepared.plan
+    pending_documents: Dict[str, PreparedDocument] = {}
+    futures: Dict[Future[Any], PreparedDocument] = {}
+    executor = ThreadPoolExecutor(max_workers=reference_workers)
+    executor_shutdown = False
+    base_reference_profile = copy.deepcopy(reference_profile)
+    result_buffer: Dict[int, Dict[str, Any]] = {}
+    next_result_index = 1
+
+    def persist_reference_result(result: Dict[str, Any], *, reused: bool) -> None:
+        nonlocal reference_profile, reference_completed_count
+        prepared = pending_documents.get(result["file_name"])
+        if prepared is None:
+            return
+
         record = prepared.record
-        can_reuse_patch = (
-            record.get("status") == "done"
-            and record.get("source_hash") == plan.source_hash
-            and isinstance(record.get("patch"), dict)
-        )
-
-        if can_reuse_patch:
-            log(f"[reference-skip] {prepared.index}. {plan.file_name}")
-            reference_profile = merge_reference_profile(reference_profile, record.get("patch"))
-            upsert_reference_document_record(progress, record)
-            reference_completed_count += 1
-            progress["reference_phase"]["completed_count"] = reference_completed_count
-            progress["reference_phase"]["reference_profile"] = copy.deepcopy(reference_profile)
-            save_progress(config.progress_path, progress)
-            emit(
-                "reference_document_done",
-                index=prepared.index,
-                file_name=plan.file_name,
-                segment_count=len(plan.segments),
-                reference_completed_count=reference_completed_count,
-                total_document_count=total_document_count,
-                reused=True,
-            )
-            continue
-
-        if not plan.segments:
-            log(f"[reference-pass] {prepared.index}. {plan.file_name} (no text)")
-            patch = empty_reference_patch()
-        else:
-            log(f"[reference] {prepared.index}. {plan.file_name} ({len(plan.segments)} segments)")
-            emit(
-                "reference_document_started",
-                index=prepared.index,
-                file_name=plan.file_name,
-                segment_count=len(plan.segments),
-                total_document_count=total_document_count,
-            )
-            patch = _extract_reference_document_patch(
-                config=config,
-                reference_client=reference_client,
-                book_metadata=reference_book_metadata,
-                base_reference_profile=reference_profile,
-                segments=plan.segments,
-                log=log,
-            )
-
+        patch = dict(result.get("patch") or empty_reference_patch())
         reference_profile = merge_reference_profile(reference_profile, patch)
-        _mark_reference_done(record, plan, patch)
+        if not reused:
+            _mark_reference_done(record, prepared.plan, patch)
         upsert_reference_document_record(progress, record)
 
         reference_completed_count += 1
@@ -867,12 +881,81 @@ def run_reference_phase(
         emit(
             "reference_document_done",
             index=prepared.index,
-            file_name=plan.file_name,
-            segment_count=len(plan.segments),
+            file_name=prepared.plan.file_name,
+            segment_count=len(prepared.plan.segments),
             reference_completed_count=reference_completed_count,
             total_document_count=total_document_count,
-            reused=False,
+            reused=reused,
         )
+
+    def drain_reference_results() -> None:
+        nonlocal next_result_index
+        while next_result_index in result_buffer:
+            result = result_buffer.pop(next_result_index)
+            persist_reference_result(result, reused=bool(result.get("reused")))
+            pending_documents.pop(result["file_name"], None)
+            next_result_index += 1
+
+    try:
+        for prepared in prepared_documents:
+            plan = prepared.plan
+            record = prepared.record
+            can_reuse_patch = (
+                record.get("status") == "done"
+                and record.get("source_hash") == plan.source_hash
+                and isinstance(record.get("patch"), dict)
+            )
+            pending_documents[plan.file_name] = prepared
+
+            if can_reuse_patch:
+                log(f"[reference-skip] {prepared.index}. {plan.file_name}")
+                result_buffer[prepared.index] = {
+                    "index": prepared.index,
+                    "file_name": plan.file_name,
+                    "patch": record.get("patch"),
+                    "segment_count": len(plan.segments),
+                    "reused": True,
+                }
+                drain_reference_results()
+                continue
+
+            future = executor.submit(
+                _extract_reference_document_worker,
+                config=config,
+                prepared=prepared,
+                book_metadata=reference_book_metadata,
+                base_reference_profile=base_reference_profile,
+                thread_local=thread_local,
+                log=log,
+                emit=emit,
+                total_document_count=total_document_count,
+            )
+            futures[future] = prepared
+
+        first_error: Optional[BaseException] = None
+        while futures:
+            done, _ = wait(list(futures.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                prepared = futures.pop(future)
+                try:
+                    result_buffer[prepared.index] = future.result()
+                except CancelledError:
+                    continue
+                except BaseException as exc:  # noqa: BLE001
+                    if first_error is None:
+                        first_error = exc
+
+            drain_reference_results()
+
+            if first_error is not None:
+                for pending_future in list(futures.keys()):
+                    pending_future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+                executor_shutdown = True
+                raise first_error
+    finally:
+        if not executor_shutdown:
+            executor.shutdown(wait=True, cancel_futures=False)
 
     progress["reference_phase"]["status"] = "done"
     progress["reference_phase"]["completed_count"] = reference_completed_count
@@ -887,7 +970,6 @@ def run_reference_phase(
         reference_fingerprint=reference_fingerprint,
     )
     return reference_profile
-
 
 def run_summary_phase(
     config: PipelineConfig,
@@ -1020,6 +1102,10 @@ def _completed_batch_indices(record: Dict[str, Any], total_batches: int) -> set[
     return completed
 
 
+def _has_complete_batch_results(record: Dict[str, Any], total_batches: int) -> bool:
+    return len(_completed_batch_indices(record, total_batches)) == total_batches
+
+
 def _collect_translated_map(record: Dict[str, Any]) -> Dict[str, str]:
     translated_map: Dict[str, str] = {}
     for entry in _sorted_translated_batch_entries(record):
@@ -1073,15 +1159,39 @@ def _finalize_translated_document(
     upsert_document_record(progress, record)
 
 
-def _translate_batch_worker(
+def _apply_stored_document_translation(prepared: PreparedDocument, progress: Dict[str, Any]) -> None:
+    record = prepared.record
+    if not prepared.plan.segments:
+        set_item_content(prepared.item, prepared.plan.raw_html)
+        return
+
+    translated_html = str(record.get("translated_html") or "")
+    if translated_html:
+        set_item_content(prepared.item, translated_html)
+        return
+
+    _finalize_translated_document(prepared, progress)
+
+
+def _get_thread_local_llm_client(config: PipelineConfig, thread_local: threading.local):
+    llm_client = getattr(thread_local, "llm_client", None)
+    if llm_client is None:
+        llm_client = _build_llm_client(config)
+        thread_local.llm_client = llm_client
+    return llm_client
+
+
+def _translate_batch_once_worker(
     *,
     config: PipelineConfig,
     book_metadata: Dict[str, str],
     prepared: PreparedDocument,
     batch_index: int,
     batch: List[Dict[str, str]],
-    translation_context_snapshot: Dict[str, Any],
-    reference_profile: Optional[Dict[str, Any]],
+    prompt_state: Dict[str, Any],
+    prompt_reference_profile: Optional[Dict[str, Any]],
+    retry_feedback: Optional[str],
+    attempt: int,
     retry_callback: Callable[[PreparedDocument, int, int, str], None],
     batch_started_callback: Callable[[PreparedDocument, int], None],
     batch_finished_callback: Callable[[], None],
@@ -1089,65 +1199,65 @@ def _translate_batch_worker(
 ) -> Dict[str, Any]:
     batch_started_callback(prepared, batch_index)
     try:
-        llm_client = getattr(thread_local, "llm_client", None)
-        if llm_client is None:
-            llm_client = _build_llm_client(config)
-            thread_local.llm_client = llm_client
-
-        prompt_state = story_state_for_prompt(translation_context_snapshot, config.recent_summary_limit)
-        prompt_reference_profile = reference_profile_for_prompt(reference_profile) if reference_profile else None
-        retry_feedback = None
-        review_payload: Dict[str, Any] = {}
-        batch_translation: Dict[str, str] = {}
-
-        for attempt in range(config.max_review_retries + 1):
-            batch_translation = llm_client.translate(
-                book_metadata=book_metadata,
-                story_state=prompt_state,
-                segments=batch,
-                source_language=config.source_language,
-                target_language=config.target_language,
-                retry_feedback=retry_feedback,
-                reference_profile=prompt_reference_profile,
-            )
-            translated_segments = _translated_segments_as_list(batch, batch_translation)
-            review_payload = llm_client.review(
-                book_metadata=book_metadata,
-                story_state=prompt_state,
-                source_segments=batch,
-                translated_segments=translated_segments,
-                source_language=config.source_language,
-                target_language=config.target_language,
-                reference_profile=prompt_reference_profile,
-            )
-            batch_translation = _apply_review_corrections(batch_translation, review_payload)
-
-            needs_retry = bool(review_payload.get("needs_retry"))
-            score = int(review_payload.get("score", 0) or 0)
-            has_material_feedback = bool(
-                review_payload.get("major_issues") or review_payload.get("retry_feedback")
-            )
-            should_retry = needs_retry or (score < config.min_review_score and has_material_feedback)
-
-            if not should_retry:
-                break
-
-            if attempt >= config.max_review_retries:
-                break
-
-            retry_feedback = review_payload.get("retry_feedback") or "; ".join(
-                review_payload.get("major_issues", [])[:3]
-            )
-            retry_callback(prepared, batch_index, attempt + 1, retry_feedback or "score too low")
-
+        llm_client = _get_thread_local_llm_client(config, thread_local)
+        batch_translation = llm_client.translate(
+            book_metadata=book_metadata,
+            story_state=prompt_state,
+            segments=batch,
+            source_language=config.source_language,
+            target_language=config.target_language,
+            retry_feedback=retry_feedback,
+            reference_profile=prompt_reference_profile,
+        )
         return {
             "file_name": prepared.plan.file_name,
             "batch_index": batch_index,
+            "batch": batch,
+            "prompt_state": prompt_state,
+            "prompt_reference_profile": prompt_reference_profile,
             "translations": batch_translation,
-            "review": review_payload,
+            "attempt": attempt,
+            "retry_feedback": retry_feedback,
         }
     finally:
         batch_finished_callback()
+
+
+def _review_batch_worker(
+    *,
+    config: PipelineConfig,
+    book_metadata: Dict[str, str],
+    prepared: PreparedDocument,
+    batch_index: int,
+    batch: List[Dict[str, str]],
+    translations: Dict[str, str],
+    prompt_state: Dict[str, Any],
+    prompt_reference_profile: Optional[Dict[str, Any]],
+    attempt: int,
+    thread_local: threading.local,
+) -> Dict[str, Any]:
+    llm_client = _get_thread_local_llm_client(config, thread_local)
+    translated_segments = _translated_segments_as_list(batch, translations)
+    review_payload = llm_client.review(
+        book_metadata=book_metadata,
+        story_state=prompt_state,
+        source_segments=batch,
+        translated_segments=translated_segments,
+        source_language=config.source_language,
+        target_language=config.target_language,
+        reference_profile=prompt_reference_profile,
+    )
+    corrected_translations = _apply_review_corrections(translations, review_payload)
+    return {
+        "file_name": prepared.plan.file_name,
+        "batch_index": batch_index,
+        "batch": batch,
+        "prompt_state": prompt_state,
+        "prompt_reference_profile": prompt_reference_profile,
+        "translations": corrected_translations,
+        "review": review_payload,
+        "attempt": attempt,
+    }
 
 
 def run_parallel_translation_phase(
@@ -1170,7 +1280,9 @@ def run_parallel_translation_phase(
     active_workers_lock = threading.Lock()
     counters_lock = threading.Lock()
     active_workers = 0
-    thread_local = threading.local()
+    translation_thread_local = threading.local()
+    review_thread_local = threading.local()
+    review_workers = max(1, config.review_workers or config.translation_workers)
 
     def current_active_workers() -> int:
         with active_workers_lock:
@@ -1191,6 +1303,7 @@ def run_parallel_translation_phase(
             batch_segment_count=len(prepared.batches[batch_index - 1]),
             active_workers=worker_count,
             translation_workers=config.translation_workers,
+            review_workers=review_workers,
         )
 
     def batch_finished_callback() -> None:
@@ -1215,13 +1328,16 @@ def run_parallel_translation_phase(
             retry_feedback=retry_feedback,
             active_workers=current_active_workers(),
             translation_workers=config.translation_workers,
+            review_workers=review_workers,
         )
 
     progress["translation_phase"]["status"] = "running"
     progress["translation_phase"]["total_batch_count"] = total_batch_count
+    prompt_reference_profile = reference_profile_for_prompt(reference_profile) if reference_profile else None
 
     pending_documents: Dict[str, PreparedDocument] = {}
-    futures: Dict[Future[Any], PreparedDocument] = {}
+    translation_futures: Dict[Future[Any], PreparedDocument] = {}
+    review_futures: Dict[Future[Any], PreparedDocument] = {}
 
     for prepared in prepared_documents:
         record = prepared.record
@@ -1237,14 +1353,15 @@ def run_parallel_translation_phase(
         total_batch_count=total_batch_count,
         completed_batch_count=completed_batch_count,
         translation_workers=config.translation_workers,
+        review_workers=review_workers,
     )
-    log(f"[translate] total batches: {total_batch_count}, workers: {config.translation_workers}")
+    log(f"[translate] total batches: {total_batch_count}, workers: {config.translation_workers}, review workers: {review_workers}")
 
     def finalize_document(prepared: PreparedDocument, *, reused: bool) -> None:
         nonlocal processed_count, skipped_count, completed_count
         record = prepared.record
         if reused:
-            set_item_content(prepared.item, record.get("translated_html") or prepared.plan.raw_html)
+            _apply_stored_document_translation(prepared, progress)
             skipped_count += 1
             completed_count += 1
             log(f"[skip] {prepared.index}. {prepared.plan.file_name}")
@@ -1274,8 +1391,9 @@ def run_parallel_translation_phase(
             total_document_count=total_document_count,
         )
 
-    executor = ThreadPoolExecutor(max_workers=max(1, config.translation_workers))
-    executor_shutdown = False
+    translation_executor = ThreadPoolExecutor(max_workers=max(1, config.translation_workers))
+    review_executor = ThreadPoolExecutor(max_workers=review_workers)
+    executors_shutdown = False
 
     def persist_batch_result(result: Dict[str, Any]) -> None:
         nonlocal completed_batch_count
@@ -1301,16 +1419,78 @@ def run_parallel_translation_phase(
             total_batch_count=total_batch_count,
             active_workers=current_active_workers(),
             translation_workers=config.translation_workers,
+            review_workers=review_workers,
         )
         if len(_completed_batch_indices(record, len(prepared.batches))) == len(prepared.batches):
             finalize_document(prepared, reused=False)
             pending_documents.pop(prepared.plan.file_name, None)
 
+    def should_retry_review(result: Dict[str, Any]) -> bool:
+        review_payload = dict(result.get("review") or {})
+        needs_retry = bool(review_payload.get("needs_retry"))
+        score = int(review_payload.get("score", 0) or 0)
+        has_material_feedback = bool(
+            review_payload.get("major_issues") or review_payload.get("retry_feedback")
+        )
+        return needs_retry or (score < config.min_review_score and has_material_feedback)
+
+    def review_retry_feedback(result: Dict[str, Any]) -> str:
+        review_payload = dict(result.get("review") or {})
+        return str(
+            review_payload.get("retry_feedback")
+            or "; ".join((review_payload.get("major_issues") or [])[:3])
+            or "score too low"
+        )
+
+    def submit_translation(
+        *,
+        prepared: PreparedDocument,
+        batch_index: int,
+        batch: List[Dict[str, str]],
+        prompt_state: Dict[str, Any],
+        retry_feedback: Optional[str] = None,
+        attempt: int = 0,
+    ) -> None:
+        future = translation_executor.submit(
+            _translate_batch_once_worker,
+            config=config,
+            book_metadata=book_metadata,
+            prepared=prepared,
+            batch_index=batch_index,
+            batch=batch,
+            prompt_state=prompt_state,
+            prompt_reference_profile=prompt_reference_profile,
+            retry_feedback=retry_feedback,
+            attempt=attempt,
+            retry_callback=retry_callback,
+            batch_started_callback=batch_started_callback,
+            batch_finished_callback=batch_finished_callback,
+            thread_local=translation_thread_local,
+        )
+        translation_futures[future] = prepared
+
+    def submit_review(translation_result: Dict[str, Any]) -> None:
+        prepared = pending_documents[translation_result["file_name"]]
+        future = review_executor.submit(
+            _review_batch_worker,
+            config=config,
+            book_metadata=book_metadata,
+            prepared=prepared,
+            batch_index=int(translation_result["batch_index"]),
+            batch=list(translation_result["batch"]),
+            translations=dict(translation_result["translations"]),
+            prompt_state=dict(translation_result["prompt_state"]),
+            prompt_reference_profile=translation_result.get("prompt_reference_profile"),
+            attempt=int(translation_result.get("attempt", 0) or 0),
+            thread_local=review_thread_local,
+        )
+        review_futures[future] = prepared
+
     try:
         for prepared in prepared_documents:
             record = prepared.record
             if not prepared.plan.segments:
-                set_item_content(prepared.item, record.get("translated_html") or prepared.plan.raw_html)
+                set_item_content(prepared.item, prepared.plan.raw_html)
                 completed_count += 1
                 emit(
                     "translation_document_done",
@@ -1323,7 +1503,7 @@ def run_parallel_translation_phase(
                 )
                 continue
 
-            if record.get("translation_status") == "done" and record.get("translated_html"):
+            if record.get("translation_status") == "done" and _has_complete_batch_results(record, len(prepared.batches)):
                 finalize_document(prepared, reused=True)
                 continue
 
@@ -1349,62 +1529,85 @@ def run_parallel_translation_phase(
             )
 
             translation_context_snapshot = dict(record.get("translation_context_snapshot") or {})
+            prompt_state = story_state_for_prompt(translation_context_snapshot, config.recent_summary_limit)
             for batch_index, batch in enumerate(prepared.batches, start=1):
                 if batch_index in completed_indices:
                     continue
-                future = executor.submit(
-                    _translate_batch_worker,
-                    config=config,
-                    book_metadata=book_metadata,
+                submit_translation(
                     prepared=prepared,
                     batch_index=batch_index,
                     batch=batch,
-                    translation_context_snapshot=translation_context_snapshot,
-                    reference_profile=reference_profile,
-                    retry_callback=retry_callback,
-                    batch_started_callback=batch_started_callback,
-                    batch_finished_callback=batch_finished_callback,
-                    thread_local=thread_local,
+                    prompt_state=prompt_state,
                 )
-                futures[future] = prepared
 
         first_error: Optional[BaseException] = None
-        while futures:
-            done, _ = wait(list(futures.keys()), return_when=FIRST_COMPLETED)
-            successful_results: List[Dict[str, Any]] = []
+        while translation_futures or review_futures:
+            active_futures = list(translation_futures.keys()) + list(review_futures.keys())
+            done, _ = wait(active_futures, return_when=FIRST_COMPLETED)
+            successful_translation_results: List[Dict[str, Any]] = []
+            successful_review_results: List[Dict[str, Any]] = []
             for future in done:
-                futures.pop(future, None)
+                future_kind = "translation" if future in translation_futures else "review"
+                if future_kind == "translation":
+                    translation_futures.pop(future, None)
+                else:
+                    review_futures.pop(future, None)
                 try:
-                    successful_results.append(future.result())
+                    result = future.result()
                 except CancelledError:
                     continue
                 except BaseException as exc:  # noqa: BLE001
                     if first_error is None:
                         first_error = exc
+                    continue
+                if future_kind == "translation":
+                    successful_translation_results.append(result)
+                else:
+                    successful_review_results.append(result)
 
-            for result in successful_results:
+            for result in successful_translation_results:
+                submit_review(result)
+
+            for result in successful_review_results:
+                if should_retry_review(result) and int(result.get("attempt", 0) or 0) < config.max_review_retries:
+                    next_attempt = int(result.get("attempt", 0) or 0) + 1
+                    feedback = review_retry_feedback(result)
+                    prepared = pending_documents[result["file_name"]]
+                    retry_callback(prepared, int(result["batch_index"]), next_attempt, feedback)
+                    submit_translation(
+                        prepared=prepared,
+                        batch_index=int(result["batch_index"]),
+                        batch=list(result["batch"]),
+                        prompt_state=dict(result["prompt_state"]),
+                        retry_feedback=feedback,
+                        attempt=next_attempt,
+                    )
+                    continue
                 persist_batch_result(result)
 
             if first_error is not None:
-                for pending_future in list(futures.keys()):
-                    pending_future.cancel()
-                executor.shutdown(wait=True, cancel_futures=True)
-                executor_shutdown = True
-                remaining_futures = list(futures.keys())
-                futures.clear()
-                for pending_future in remaining_futures:
-                    if pending_future.cancelled():
-                        continue
+                finished_review_futures = [
+                    future for future in list(review_futures.keys()) if future.done() and not future.cancelled()
+                ]
+                for review_future in finished_review_futures:
+                    review_futures.pop(review_future, None)
                     try:
-                        result = pending_future.result()
+                        persist_batch_result(review_future.result())
                     except BaseException:  # noqa: BLE001
-                        continue
-                    else:
-                        persist_batch_result(result)
+                        pass
+
+                for pending_future in list(translation_futures.keys()) + list(review_futures.keys()):
+                    pending_future.cancel()
+                translation_executor.shutdown(wait=True, cancel_futures=True)
+                review_executor.shutdown(wait=True, cancel_futures=True)
+                executors_shutdown = True
+                translation_futures.clear()
+                review_futures.clear()
                 raise first_error
     finally:
-        if not executor_shutdown:
-            executor.shutdown(wait=True, cancel_futures=False)
+        if not executors_shutdown:
+            translation_executor.shutdown(wait=True, cancel_futures=False)
+            review_executor.shutdown(wait=True, cancel_futures=False)
 
     progress["translation_phase"]["status"] = "done"
     progress["translation_phase"]["completed_batch_count"] = completed_batch_count
@@ -1529,6 +1732,8 @@ def run_translation_pipeline(
         "translation_completed_batch_count": translation_result["completed_batch_count"],
         "translation_total_batch_count": translation_result["total_batch_count"],
         "translation_workers": config.translation_workers,
+        "review_workers": max(1, config.review_workers or config.translation_workers),
+        "reference_workers": max(1, config.reference_workers or config.translation_workers),
         "reference_enabled": reference_context.enabled,
         "reference_completed_count": len(prepared_reference_documents) if reference_context.enabled else 0,
     }

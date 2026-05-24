@@ -74,6 +74,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('id="reference_manual_input_path"', html)
             self.assertIn("参考提取", html)
             self.assertIn('id="translation_workers" name="translation_workers" type="number" min="1" step="1" value="4"', html)
+            self.assertIn('id="review_workers" name="review_workers" type="number" min="0" step="1"', html)
+            self.assertIn('id="reference_workers" name="reference_workers" type="number" min="0" step="1"', html)
             self.assertIn('"deepseek_model": "deepseek-v4-flash"', html)
 
     def test_discover_epub_files_skips_output_dir(self):
@@ -187,6 +189,8 @@ class WebAppTests(unittest.TestCase):
                     "model": "mock-model",
                     "base_url": "",
                     "translation_workers": "7",
+                    "review_workers": "3",
+                    "reference_workers": "2",
                     "max_batch_chars": "900",
                     "max_batch_segments": "23",
                     "max_review_retries": "1",
@@ -205,6 +209,8 @@ class WebAppTests(unittest.TestCase):
             self.assertIn('<option value="mock" selected>', html)
             self.assertIn('value="简体中文"', html)
             self.assertIn('id="translation_workers" name="translation_workers" type="number" min="1" step="1" value="7"', html)
+            self.assertIn('id="review_workers" name="review_workers" type="number" min="0" step="1" placeholder="沿用翻译并发" value="3"', html)
+            self.assertIn('id="reference_workers" name="reference_workers" type="number" min="0" step="1" placeholder="沿用翻译并发" value="2"', html)
             self.assertIn('value="900"', html)
             self.assertIn('value="23"', html)
             self.assertIn('value="（测试译本）"', html)

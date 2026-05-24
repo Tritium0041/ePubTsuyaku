@@ -147,9 +147,20 @@
 
         <div class="three-col">
           <div class="field">
+            <label for="review_workers">校对并发数</label>
+            <input id="review_workers" name="review_workers" type="number" min="0" step="1" placeholder="沿用翻译并发" value="{{ state.form_state.review_workers }}">
+          </div>
+          <div class="field">
+            <label for="reference_workers">参考并发数</label>
+            <input id="reference_workers" name="reference_workers" type="number" min="0" step="1" placeholder="沿用翻译并发" value="{{ state.form_state.reference_workers }}">
+          </div>
+          <div class="field">
             <label for="max_review_retries">最大重试次数</label>
             <input id="max_review_retries" name="max_review_retries" type="number" min="0" step="1" value="{{ state.form_state.max_review_retries }}">
           </div>
+        </div>
+
+        <div class="three-col">
           <div class="field">
             <label for="min_review_score">最低校对分</label>
             <input id="min_review_score" name="min_review_score" type="number" min="1" max="100" step="1" value="{{ state.form_state.min_review_score }}">

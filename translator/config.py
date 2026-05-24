@@ -27,6 +27,8 @@ class PipelineConfig:
     translation_model: str
     review_model: str
     translation_workers: int = 4
+    review_workers: int = 0
+    reference_workers: int = 0
     auto_resume_retries: int = 2
     max_batch_chars: int = 3500
     max_batch_segments: int = 64

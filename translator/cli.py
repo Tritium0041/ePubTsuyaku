@@ -59,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--translation-model", help="初翻阶段模型名。")
     parser.add_argument("--review-model", help="校对阶段模型名。")
     parser.add_argument("--translation-workers", type=int, default=4, help="翻译阶段的并发 worker 数。")
+    parser.add_argument("--review-workers", type=int, default=0, help="校对阶段的并发 worker 数，默认沿用翻译并发数。")
+    parser.add_argument("--reference-workers", type=int, default=0, help="参考 EPUB 提取阶段的并发 worker 数，默认沿用翻译并发数。")
     parser.add_argument("--auto-resume-retries", type=int, default=2, help="任务失败时自动续跑的额外次数。")
     parser.add_argument("--progress-file", default="progress.json", help="断点续跑文件路径。")
     parser.add_argument("--max-batch-chars", type=int, default=3500, help="单批次最多传给模型的字符数。")
@@ -117,6 +119,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         translation_model=args.translation_model or model,
         review_model=args.review_model or model,
         translation_workers=max(1, args.translation_workers),
+        review_workers=max(0, args.review_workers),
+        reference_workers=max(0, args.reference_workers),
         auto_resume_retries=max(0, args.auto_resume_retries),
         max_batch_chars=args.max_batch_chars,
         max_batch_segments=args.max_batch_segments,

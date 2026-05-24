@@ -539,6 +539,46 @@ def _normalize_document_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _can_omit_translated_html(record: Dict[str, Any]) -> bool:
+    translated_html = str(record.get("translated_html") or "")
+    if not translated_html:
+        return False
+
+    segment_count = int(record.get("segment_count", 0) or 0)
+    batch_count = int(record.get("batch_count", 0) or 0)
+    if segment_count == 0:
+        return True
+    if batch_count <= 0:
+        return False
+
+    translated_batches = _normalize_translated_batches(record.get("translated_batches"))
+    completed_batches = 0
+    for entry in translated_batches.values():
+        batch_index = int(entry.get("batch_index", 0) or 0)
+        if (
+            1 <= batch_index <= batch_count
+            and isinstance(entry.get("translations"), dict)
+            and entry.get("translations")
+        ):
+            completed_batches += 1
+    return completed_batches >= batch_count
+
+
+def _lightweight_progress_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    light_payload = dict(payload)
+    documents = payload.get("documents", {}) or {}
+    light_documents: Dict[str, Dict[str, Any]] = {}
+    for file_name, record in documents.items():
+        if not isinstance(record, dict):
+            continue
+        light_record = dict(record)
+        if _can_omit_translated_html(light_record):
+            light_record["translated_html"] = ""
+        light_documents[str(file_name)] = light_record
+    light_payload["documents"] = light_documents
+    return light_payload
+
+
 def _normalize_reference_document_record(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(record or {})
     normalized.setdefault("file_name", "")
@@ -705,7 +745,7 @@ def create_progress_document(
 
 
 def save_progress(path: Path, payload: Dict[str, Any]) -> None:
-    normalized = _migrate_progress_document(payload)
+    normalized = _migrate_progress_document(_lightweight_progress_payload(payload))
     normalized["version"] = PROGRESS_VERSION
     normalized["story_state"] = copy.deepcopy(normalized["summary_phase"]["story_state"])
     path.parent.mkdir(parents=True, exist_ok=True)

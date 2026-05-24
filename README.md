@@ -178,6 +178,8 @@ epubOutput/<原文件名>.<目标语言>.epub
 - `--model`：统一指定默认模型
 - `--summary-model` / `--translation-model` / `--review-model`：分阶段指定模型
 - `--translation-workers 4`：翻译阶段 worker 数
+- `--review-workers 0`：校对阶段 worker 数，`0` 表示沿用翻译并发数
+- `--reference-workers 0`：参考 EPUB 提取阶段 worker 数，`0` 表示沿用翻译并发数
 - `--auto-resume-retries 2`：任务失败后自动续跑次数
 - `--progress-file progress.json`：断点续跑文件
 - `--reset-progress`：忽略现有 progress，从头开始
