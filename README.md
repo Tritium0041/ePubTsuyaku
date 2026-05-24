@@ -1,8 +1,8 @@
-# epubTranslatorWithLLM
+# ePubTsuyaku
 
-> LLM-based EPUB translator with resumable pipeline, reference-volume consistency, OpenAI-compatible backends, and a local Web UI.
+> ePubTsuyaku is an LLM-based EPUB translation workspace with resumable pipeline, reference-volume consistency, OpenAI-compatible backends, and a local Web UI.
 
-`epubTranslatorWithLLM` 是一个面向长篇 EPUB 的翻译工具。它不是“一次把整章丢给模型机翻”的脚本，而是一条完整流水线：
+`ePubTsuyaku` 是一个面向长篇 EPUB 的翻译工具。它不是“一次把整章丢给模型机翻”的脚本，而是一条完整流水线：
 
 1. 按 `spine` 顺序读取正文，先做全书上下文整理
 2. 冻结章节上下文后并行翻译批次
@@ -75,7 +75,7 @@ python3 -m pip install -r requirements.txt
 
 默认的自动探测顺序如下：
 
-1. `EPUB_TRANSLATOR_API_KEY`
+1. `EPUB_TSUYAKU_API_KEY`
 2. `OPENAI_API_KEY`
 3. `ALIYUN_API_KEY`
 4. `DEEPSEEK_API_KEY`
@@ -83,13 +83,16 @@ python3 -m pip install -r requirements.txt
 常用可选变量：
 
 ```bash
-export EPUB_TRANSLATOR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-export EPUB_TRANSLATOR_MODEL=qwen-max
+export EPUB_TSUYAKU_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export EPUB_TSUYAKU_MODEL=qwen-max
 ```
 
-也兼容旧变量：
+也兼容旧项目变量和供应商变量：
 
 ```bash
+export EPUB_TRANSLATOR_API_KEY=your_api_key
+export EPUB_TRANSLATOR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export EPUB_TRANSLATOR_MODEL=qwen-max
 export ALIYUN_API_KEY=your_aliyun_api_key
 export DEEPSEEK_API_KEY=your_deepseek_api_key
 ```
@@ -202,7 +205,7 @@ epubOutput/<原文件名>.<目标语言>.epub
 ## 项目结构
 
 ```text
-epubTranslatorWithLLM/
+ePubTsuyaku/
 ├── main.py
 ├── webui.py
 ├── requirements.txt
@@ -218,6 +221,7 @@ epubTranslatorWithLLM/
 │   ├── static/
 │   └── templates/
 ├── tests/
+│   ├── test_config.py
 │   ├── test_epub_utils.py
 │   ├── test_llm.py
 │   ├── test_pipeline.py

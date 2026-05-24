@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EPUB Translator Studio</title>
+  <title>ePubTsuyaku Studio</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
 <body>
   <div class="backdrop"></div>
   <main class="shell">
     <section class="hero">
-      <p class="eyebrow">EPUB Translator Studio</p>
+      <p class="eyebrow">ePubTsuyaku Studio</p>
       <h1>别再手写命令了。</h1>
-      <p class="intro">在一个页面里完成选书、填模型、启动翻译、看进度和下载结果。后台仍然复用你现有的翻译 pipeline，不是另起一套逻辑。</p>
+      <p class="intro">在一个页面里完成选书、填模型、启动翻译、看进度和下载结果。后台由 ePubTsuyaku 的同一套翻译流水线执行。</p>
     </section>
 
     {% with messages = get_flashed_messages(with_categories=true) %}

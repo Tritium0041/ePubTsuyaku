@@ -40,7 +40,7 @@ def _resolve_output_path(project_root: Path, input_path: Path, output_arg: Optio
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="使用 LLM 对 EPUB 进行章节级翻译、校对和重建。")
+    parser = argparse.ArgumentParser(description="ePubTsuyaku：使用 LLM 对 EPUB 进行章节级翻译、校对和重建。")
     parser.add_argument("--input", help="待翻译的 epub 路径。默认读取 testBook/ 下的第一个 epub。")
     parser.add_argument("--reference-epub", help="可选：前作精翻参考 epub 路径。")
     parser.add_argument("--output", help="输出 epub 路径，默认写入 epubOutput/。")
@@ -133,7 +133,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     result = run_translation_pipeline_with_retries(config)
     print("")
-    print("Translation finished:")
+    print("ePubTsuyaku translation finished:")
     print(f"  input: {result['input_path']}")
     print(f"  output: {result['output_path']}")
     print(f"  progress: {result['progress_path']}")

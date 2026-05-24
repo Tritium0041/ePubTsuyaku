@@ -17,7 +17,10 @@ from flask import Flask, flash, jsonify, redirect, render_template, request, sen
 from .config import (
     ALIYUN_BASE_URL,
     DEEPSEEK_BASE_URL,
+    LEGACY_PROJECT_API_KEY_ENV,
     PipelineConfig,
+    PROJECT_API_KEY_ENV,
+    first_env,
     resolve_provider_settings,
 )
 from .epub_utils import extract_book_metadata, iter_spine_documents
@@ -185,9 +188,9 @@ def resolve_web_provider_settings(
         return "openai-compatible", effective_key, clean_base_url or ALIYUN_BASE_URL, clean_model or "qwen-max"
 
     if provider_preset == "openai-compatible":
-        effective_key = clean_key or os.environ.get("EPUB_TRANSLATOR_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        effective_key = clean_key or first_env(PROJECT_API_KEY_ENV, LEGACY_PROJECT_API_KEY_ENV, "OPENAI_API_KEY")
         if not effective_key:
-            raise RuntimeError("OpenAI 兼容模式需要填写 API Key，或提前设置 EPUB_TRANSLATOR_API_KEY / OPENAI_API_KEY。")
+            raise RuntimeError("OpenAI 兼容模式需要填写 API Key，或提前设置 EPUB_TSUYAKU_API_KEY / OPENAI_API_KEY。")
         return "openai-compatible", effective_key, clean_base_url, clean_model or "gpt-4.1-mini"
 
     return resolve_provider_settings(
@@ -684,7 +687,7 @@ class JobManager:
 def create_app(project_root: Optional[Path] = None) -> Flask:
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
     app = Flask(__name__, template_folder="templates", static_folder="static")
-    app.secret_key = "epub-translator-webui"
+    app.secret_key = "epub-tsuyaku-webui"
     manager = JobManager(root)
     app.config["JOB_MANAGER"] = manager
     app.config["PROJECT_ROOT"] = root
@@ -731,7 +734,7 @@ def create_app(project_root: Optional[Path] = None) -> Flask:
 
 
 def build_web_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="启动 EPUB Translator Web UI。")
+    parser = argparse.ArgumentParser(description="启动 ePubTsuyaku Web UI。")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认 127.0.0.1。")
     parser.add_argument("--port", type=int, default=7860, help="监听端口，默认 7860。")
     parser.add_argument("--debug", action="store_true", help="是否开启 Flask debug。")

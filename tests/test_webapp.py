@@ -68,6 +68,8 @@ class WebAppTests(unittest.TestCase):
             html = response.get_data(as_text=True)
 
             self.assertEqual(response.status_code, 200)
+            self.assertIn("ePubTsuyaku Studio", html)
+            self.assertIn("ePubTsuyaku 的同一套翻译流水线", html)
             self.assertIn('value="deepseek-v4-flash"', html)
             self.assertIn('value="4000"', html)
             self.assertIn('id="reference_existing_file"', html)
