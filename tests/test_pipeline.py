@@ -2,6 +2,7 @@ import copy
 import threading
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -706,6 +707,37 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertTrue(shared["first_waited_for_second"])
             progress = load_progress(progress_path)
             self.assertEqual(progress["reference_phase"]["reference_profile"]["series_notes"], ["一", "二"])
+
+    def test_output_epub_metadata_uses_target_language_and_ltr_layout(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_path = tmp_path / "input.epub"
+            output_path = tmp_path / "output.epub"
+            progress_path = tmp_path / "progress.json"
+
+            build_sample_epub(input_path)
+            config = make_config(
+                input_path=input_path,
+                output_path=output_path,
+                progress_path=progress_path,
+                provider="mock",
+                translation_workers=1,
+                target_language="中文",
+            )
+
+            run_translation_pipeline(config)
+
+            translated_book = epub.read_epub(str(output_path))
+            self.assertEqual(translated_book.get_metadata("DC", "language")[0][0], "zh-CN")
+            with zipfile.ZipFile(output_path) as archive:
+                opf_name = next(name for name in archive.namelist() if name.endswith(".opf"))
+                opf_text = archive.read(opf_name).decode("utf-8")
+                self.assertIn('page-progression-direction="ltr"', opf_text)
+                chapter_name = next(name for name in archive.namelist() if name.endswith("chapter1.xhtml"))
+                chapter_text = archive.read(chapter_name).decode("utf-8")
+                self.assertIn('lang="zh-CN"', chapter_text)
+                self.assertIn('xml:lang="zh-CN"', chapter_text)
+                self.assertIn('dir="ltr"', chapter_text)
 
     def test_auto_resume_retries_retryable_run_errors_and_reuses_progress(self):
         shared = {"translated_inputs": [], "failed_once": False}

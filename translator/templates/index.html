@@ -367,7 +367,11 @@
       metaOutput.textContent = job.output_path || "-";
       metaProgress.textContent = job.progress_path || "-";
       metaModel.textContent = job.model || "-";
-      logOutput.textContent = (job.logs || []).join("\n") || "暂无日志。";
+      const nextLogText = (job.logs || []).join("\n") || "暂无日志。";
+      if (logOutput.textContent !== nextLogText) {
+        logOutput.textContent = nextLogText;
+        logOutput.scrollTop = logOutput.scrollHeight;
+      }
 
       if (job.download_url) {
         downloadLink.classList.remove("disabled");
@@ -387,6 +391,7 @@
         updateStatus(snapshot);
       } catch (error) {
         logOutput.textContent = `读取状态失败：${error}`;
+        logOutput.scrollTop = logOutput.scrollHeight;
       }
     }
 

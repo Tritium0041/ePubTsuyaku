@@ -10,6 +10,9 @@ from bs4 import BeautifulSoup
 from bs4.element import Comment, Declaration, Doctype, NavigableString, ProcessingInstruction, Tag
 
 
+MIN_FALLBACK_TEXT_CHARS = 1000
+MIN_FALLBACK_SEGMENT_RATIO = 0.1
+
 SEGMENT_BLOCK_TAGS = {
     "p",
     "li",
@@ -157,6 +160,64 @@ def _block_text_nodes(element: Tag) -> List[NavigableString]:
     return nodes
 
 
+def _append_segment(blocks: List[SegmentBlock], segments: List[Dict[str, str]], element: Tag, source_text: str) -> None:
+    cleaned_text = source_text.strip()
+    if not cleaned_text:
+        return
+    segment_id = f"seg_{len(blocks) + 1:04d}"
+    blocks.append(SegmentBlock(segment_id=segment_id, element=element, source_text=source_text))
+    segments.append({"id": segment_id, "text": cleaned_text})
+
+
+def _fallback_plain_text_segments(soup: BeautifulSoup) -> List[str]:
+    root = soup.body or soup
+    lines: List[str] = []
+    current: List[str] = []
+
+    def flush() -> None:
+        text = _clean_text_value("".join(current))
+        if text:
+            lines.append(text)
+        current.clear()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, NavigableString):
+            if _is_translatable_node(node):
+                current.append(str(node))
+            return
+        if not isinstance(node, Tag):
+            return
+        name = node.name.lower()
+        if name in SKIPPED_TEXT_TAGS:
+            return
+        if name == "br":
+            flush()
+            return
+        if name in SEGMENT_BLOCK_TAGS and current:
+            flush()
+        for child in node.children:
+            walk(child)
+        if name in SEGMENT_BLOCK_TAGS:
+            flush()
+
+    walk(root)
+    flush()
+    return lines
+
+
+def _add_plain_text_fallback_document(soup: BeautifulSoup, lines: List[str]) -> Tag:
+    container = soup.new_tag("div")
+    container["data-epub-tsuyaku-fallback"] = "br-text"
+    for line in lines:
+        paragraph = soup.new_tag("p")
+        paragraph.string = line
+        container.append(paragraph)
+    target = soup.body or soup
+    target.clear()
+    target.append(container)
+    return container
+
+
 def prepare_document(item: Any) -> DocumentPlan:
     raw_html = content_to_text(item.get_content())
     soup = BeautifulSoup(raw_html, "html.parser")
@@ -170,12 +231,21 @@ def prepare_document(item: Any) -> DocumentPlan:
         if not text_nodes:
             continue
         source_text = "".join(str(node) for node in text_nodes)
-        cleaned_text = source_text.strip()
-        if not cleaned_text:
-            continue
-        segment_id = f"seg_{len(blocks) + 1:04d}"
-        blocks.append(SegmentBlock(segment_id=segment_id, element=element, source_text=source_text))
-        segments.append({"id": segment_id, "text": cleaned_text})
+        _append_segment(blocks, segments, element, source_text)
+
+    plain_lines = _fallback_plain_text_segments(soup)
+    plain_text_chars = sum(len(line) for line in plain_lines)
+    segment_text_chars = sum(len(segment["text"]) for segment in segments)
+    if (
+        plain_text_chars >= MIN_FALLBACK_TEXT_CHARS
+        and segment_text_chars < plain_text_chars * MIN_FALLBACK_SEGMENT_RATIO
+    ):
+        blocks = []
+        segments = []
+        container = _add_plain_text_fallback_document(soup, plain_lines)
+        for paragraph in container.find_all("p"):
+            if isinstance(paragraph, Tag):
+                _append_segment(blocks, segments, paragraph, paragraph.get_text())
 
     item_id = getattr(item, "id", None) or getattr(item, "uid", None) or ""
     return DocumentPlan(

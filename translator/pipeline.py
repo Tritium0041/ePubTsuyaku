@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import ebooklib
 from ebooklib import epub
 
 from .config import PipelineConfig
@@ -42,6 +43,16 @@ from .state import (
 )
 
 DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
+OUTPUT_LAYOUT_CSS_ID = "epub_tsuyaku_output_layout"
+OUTPUT_LAYOUT_CSS_NAME = "Styles/epub-tsuyaku-output-layout.css"
+OUTPUT_LAYOUT_CSS = """
+html,
+body {
+  direction: ltr;
+  writing-mode: horizontal-tb;
+  -webkit-writing-mode: horizontal-tb;
+}
+""".strip()
 
 RETRYABLE_RUN_ERROR_SNIPPETS = (
     "严格 schema 调用失败",
@@ -437,6 +448,58 @@ def _set_book_title(book: Any, title: str) -> None:
         metadata[DC_NAMESPACE]["title"] = [(title, {})]
 
 
+def _normalize_output_language_code(target_language: str) -> str:
+    normalized = str(target_language or "").strip().lower()
+    if any(token in normalized for token in ("中文", "汉语", "漢語", "chinese", "zh")):
+        return "zh-CN" if "繁" not in normalized and "tw" not in normalized and "hk" not in normalized else "zh-TW"
+    return target_language or "zh-CN"
+
+
+def _prepare_output_book_metadata(book: Any, target_language: str) -> None:
+    language_code = _normalize_output_language_code(target_language)
+    if hasattr(book, "set_language"):
+        book.set_language(language_code)
+    else:
+        book.language = language_code
+
+    metadata = getattr(book, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata.setdefault(DC_NAMESPACE, {})
+        metadata[DC_NAMESPACE]["language"] = [(language_code, {})]
+
+    if hasattr(book, "set_direction"):
+        book.set_direction("ltr")
+    else:
+        book.direction = "ltr"
+
+    layout_item = None
+    if hasattr(book, "get_item_with_id"):
+        layout_item = book.get_item_with_id(OUTPUT_LAYOUT_CSS_ID)
+    if layout_item is None:
+        layout_item = epub.EpubItem(
+            uid=OUTPUT_LAYOUT_CSS_ID,
+            file_name=OUTPUT_LAYOUT_CSS_NAME,
+            media_type="text/css",
+            content=OUTPUT_LAYOUT_CSS,
+        )
+        if hasattr(book, "add_item"):
+            book.add_item(layout_item)
+    elif hasattr(layout_item, "set_content"):
+        layout_item.set_content(OUTPUT_LAYOUT_CSS)
+
+    for item in book.get_items():
+        if getattr(item, "get_type", lambda: None)() != ebooklib.ITEM_DOCUMENT:
+            continue
+        if hasattr(item, "set_language"):
+            item.set_language(language_code)
+        elif hasattr(item, "lang"):
+            item.lang = language_code
+        if hasattr(item, "direction"):
+            item.direction = "ltr"
+        if layout_item is not None and hasattr(item, "add_item"):
+            item.add_item(layout_item)
+
+
 def _create_document_record(plan: Any, batch_count: int) -> Dict[str, Any]:
     return {
         "file_name": plan.file_name,
@@ -467,7 +530,11 @@ def _create_reference_document_record(plan: Any) -> Dict[str, Any]:
 
 def _ensure_reference_document_record(progress: Dict[str, Any], plan: Any) -> Dict[str, Any]:
     record = get_reference_document_record(progress, plan.file_name)
-    if record is None or record.get("source_hash") != plan.source_hash:
+    if (
+        record is None
+        or record.get("source_hash") != plan.source_hash
+        or int(record.get("segment_count", -1) or -1) != len(plan.segments)
+    ):
         record = _create_reference_document_record(plan)
         upsert_reference_document_record(progress, record)
         return record
@@ -482,7 +549,12 @@ def _ensure_reference_document_record(progress: Dict[str, Any], plan: Any) -> Di
 
 def _ensure_document_record(progress: Dict[str, Any], plan: Any, batch_count: int) -> Dict[str, Any]:
     record = get_document_record(progress, plan.file_name)
-    if record is None or record.get("source_hash") != plan.source_hash:
+    if (
+        record is None
+        or record.get("source_hash") != plan.source_hash
+        or int(record.get("segment_count", -1) or -1) != len(plan.segments)
+        or int(record.get("batch_count", -1) or -1) != batch_count
+    ):
         record = _create_document_record(plan, batch_count)
         upsert_document_record(progress, record)
         return record
@@ -903,6 +975,7 @@ def run_reference_phase(
             can_reuse_patch = (
                 record.get("status") == "done"
                 and record.get("source_hash") == plan.source_hash
+                and record.get("segment_count") == len(plan.segments)
                 and isinstance(record.get("patch"), dict)
             )
             pending_documents[plan.file_name] = prepared
@@ -1001,6 +1074,7 @@ def run_summary_phase(
         can_reuse_summary = (
             record.get("summary_status") == "done"
             and record.get("source_hash") == plan.source_hash
+            and record.get("segment_count") == len(plan.segments)
             and isinstance(record.get("summary_patch"), dict)
             and bool(record.get("translation_context_snapshot"))
         )
@@ -1714,11 +1788,12 @@ def run_translation_pipeline(
     if config.title_suffix:
         _set_book_title(book, f"{book_metadata['title']}{config.title_suffix}")
 
+    _prepare_output_book_metadata(book, config.target_language)
     translated_title_lookup = _build_translated_title_lookup(book)
     _ensure_book_item_identifiers(book)
     book.toc = tuple(_rewrite_toc_titles(_normalize_toc(book.toc), translated_title_lookup))
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    epub.write_epub(str(config.output_path), book, {})
+    epub.write_epub(str(config.output_path), book, {"spine_direction": True})
 
     result = {
         "input_path": str(config.input_path),

@@ -1,5 +1,6 @@
 import unittest
 
+from translator.epub_utils import apply_translations
 from translator.epub_utils import batch_segments
 from translator.epub_utils import extract_document_title
 from translator.epub_utils import prepare_document
@@ -48,6 +49,34 @@ class PrepareDocumentTests(unittest.TestCase):
         title = extract_document_title(html, fallback="Fallback")
 
         self.assertEqual(title, "[中文] 第一章")
+
+    def test_prepare_document_falls_back_to_br_separated_text(self):
+        class FakeItem:
+            file_name = "volume.xhtml"
+            id = "volume"
+
+            def get_content(self):
+                body = "<h2>目录</h2>" + "<br/>".join(
+                    ["第一章", "雨一直下。", "润奈坐在窗边。", "诗暮叹了口气。"] * 80
+                )
+                return f"""
+        <html xmlns="http://www.w3.org/1999/xhtml">
+          <body>
+            <div>{body}</div>
+          </body>
+        </html>
+        """.encode("utf-8")
+
+        plan = prepare_document(FakeItem())
+
+        self.assertGreater(len(plan.segments), 100)
+        self.assertIn("雨一直下。", [segment["text"] for segment in plan.segments])
+
+        translated = {segment["id"]: f"译文{index}" for index, segment in enumerate(plan.segments, start=1)}
+        rendered = apply_translations(plan, translated)
+
+        self.assertIn("<p>译文1</p>", rendered)
+        self.assertIn('data-epub-tsuyaku-fallback="br-text"', rendered)
 
 
 if __name__ == "__main__":
